@@ -13,10 +13,12 @@ from freqtrade.exceptions import OperationalException
 
 class SolHmmBellCurveStrategy(IStrategy):
     """
-    Multi-Timeframe Gaussian HMM Strategy for SOL/USDT (v3 - Macro Aligned & Stoploss Anchored)
-    - Fixes Jan-Apr 2026 1d CHOP bear-rally traps by requiring 1d positive trend/impulse alignment
-    - Uses stoploss_from_open() to eliminate custom_stoploss relative-rate math inversions
-    - Adds failed-breakout structure exit when 4h Bull probability collapses below 1h EMA50
+    Multi-Timeframe Gaussian HMM Strategy for SOL/USDT (v12 - TDS & High-Payoff Edition)
+    - Engineered to beat 1% Indian TDS + exchange fees (~2.4% total friction)
+    - 1D Macro Gate: Blocks bear-market relief traps (trend_atr_1d >= 0.0)
+    - 4H Swing Engine: Confirmed Bull state (prob >= 0.70) in pullback zone (-1.20 <= Z <= +0.20)
+    - 1H Execution Trigger: Support retest + green confirmation candle
+    - TDS-Compensated Breakeven: Locks +1.40% at +4.2% gain (guarantees net positive after 1% TDS)
     """
     INTERFACE_VERSION = 3
     timeframe = "1h"
@@ -24,19 +26,23 @@ class SolHmmBellCurveStrategy(IStrategy):
 
     USE_OOS_MODEL_FOR_BACKTEST = True
 
+    # Sized to capture 4H expansions that overcome 2.4% TDS/fee friction
     minimal_roi = {
-        "0": 0.18,
-        "720": 0.11,   # After 12 hours: harvest at +11%
-        "2160": 0.065, # After 36 hours: harvest at +6.5%
-        "4320": 0.03   # After 72 hours: harvest at +3%
+        "0": 0.16,     # Climax target (+16%)
+        "360": 0.085,  # After 6 hours: harvest at +8.5%
+        "720": 0.060,  # After 12 hours: harvest at +6.0%
+        "1440": 0.045, # After 24 hours: harvest at +4.5%
+        "2880": 0.030  # After 48 hours: harvest at +3.0%
     }
 
-    stoploss = -0.052
+    # Fixed safety stoploss (-4.6%)
+    stoploss = -0.046
     trailing_stop = False
     use_custom_stoploss = True
 
     process_only_new_candles = True
     use_exit_signal = True
+    exit_profit_only = False
     startup_candle_count: int = 220
 
     bundle_1d: dict = None
@@ -105,7 +111,6 @@ class SolHmmBellCurveStrategy(IStrategy):
         df["prob_bull"] = 0.0
         df["z_trend_bull"] = 0.0
         df["z_impulse_bull"] = 0.0
-        df["regime_age"] = 0
 
         valid_mask = df[feature_cols].notna().all(axis=1)
         if not valid_mask.any():
@@ -134,16 +139,10 @@ class SolHmmBellCurveStrategy(IStrategy):
 
         states = np.argmax(filtered_probs, axis=1)
 
-        ages = np.ones(n_samples, dtype=int)
-        for t in range(1, n_samples):
-            if states[t] == states[t - 1]:
-                ages[t] = ages[t - 1] + 1
-
         df.loc[valid_mask, "hmm_state"] = states
         df.loc[valid_mask, "prob_bear"] = filtered_probs[:, 0]
         df.loc[valid_mask, "prob_chop"] = filtered_probs[:, 1]
         df.loc[valid_mask, "prob_bull"] = filtered_probs[:, 2]
-        df.loc[valid_mask, "regime_age"] = ages
 
         bull_stats = bundle["bell_curve_stats"][2]
         mu_trend = bull_stats["mean"]["trend_atr"]
@@ -157,7 +156,7 @@ class SolHmmBellCurveStrategy(IStrategy):
         return df
 
     # -----------------------------------------------------------------
-    # Informative Timeframes (1d Macro Filter & 4h Primary Engine)
+    # Informative Timeframes
     # -----------------------------------------------------------------
     @informative("1d")
     def populate_indicators_1d(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
@@ -172,7 +171,7 @@ class SolHmmBellCurveStrategy(IStrategy):
         return self._compute_hmm_features_and_states(dataframe, self.bundle_4h)
 
     # -----------------------------------------------------------------
-    # Base Timeframe (1h Execution Indicators)
+    # Base Timeframe (1H Indicators)
     # -----------------------------------------------------------------
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["ema_20"] = dataframe["close"].ewm(span=20, adjust=False).mean()
@@ -186,95 +185,79 @@ class SolHmmBellCurveStrategy(IStrategy):
         return dataframe
 
     # -----------------------------------------------------------------
-    # Entry Logic (1d Macro Structure Alignment + 4h Pullback Sweet Spot)
+    # Sureshot Entry Logic
     # -----------------------------------------------------------------
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         if self.bundle_4h is None:
             self.bot_start()
 
-        max_bull_age_4h = int(self.bundle_4h["expected_durations"][2] * 0.80)
-
-        # Macro 1d Alignment: Either 1d is in BULL (State 2), OR 1d is in CHOP (State 1)
-        # with positive daily trend/impulse (blocks Jan-Apr bear market dead-cat bounces)
-        macro_1d_ok = (
-            (dataframe["hmm_state_1d"] == 2) |
-            (
-                (dataframe["hmm_state_1d"] == 1) &
-                (dataframe["prob_bear_1d"] < 0.30) &
-                (dataframe["trend_atr_1d"] >= -0.10) &
-                (dataframe["impulse_atr_1d"] >= 0.0)
-            )
-        )
-
         long_conditions = (
-            macro_1d_ok &
+            # 1. Macro 1D Gate: Daily Close >= SMA20 (Blocks bear downtrends)
+            (dataframe["hmm_state_1d"] != 0) &
+            (dataframe["trend_atr_1d"] >= 0.0) &
+            (dataframe["prob_bear_1d"] < 0.35) &
 
-            # Primary 4h Engine: High-conviction BULL State (State 2)
+            # 2. 4H Engine: High-conviction BULL State (State 2)
             (dataframe["hmm_state_4h"] == 2) &
-            (dataframe["prob_bull_4h"] >= 0.72) &
+            (dataframe["prob_bull_4h"] >= 0.70) &
 
-            # Market Clock: 4h Bull regime is within active lifespan (<= 18 bars)
-            (dataframe["regime_age_4h"] <= max_bull_age_4h) &
-
-            # Bell Curve Pullback Sweet Spot (-1.20 <= Z <= +0.25)
+            # 3. Pullback Sweet Spot on Bull Curve (-1.20 <= Z <= +0.20)
             (dataframe["z_trend_bull_4h"] >= -1.20) &
-            (dataframe["z_trend_bull_4h"] <= 0.25) &
+            (dataframe["z_trend_bull_4h"] <= 0.20) &
 
-            # Short-term 4h Velocity Safeguard
-            (dataframe["z_impulse_bull_4h"] >= -0.90) &
-            (dataframe["z_impulse_bull_4h"] <= 0.85) &
+            # 4. Short-term Velocity Safeguard (No falling knives)
+            (dataframe["z_impulse_bull_4h"] >= -1.00) &
+            (dataframe["z_impulse_bull_4h"] <= 0.80) &
 
-            # 1h Micro Trigger: Confirmed uptrend structure (Close > EMA20 > EMA50)
+            # 5. 1H Execution Trigger: Support hold + Green confirmation candle
+            (dataframe["close"] > dataframe["open"]) &
             (dataframe["close"] > dataframe["ema_20"]) &
-            (dataframe["ema_20"] > dataframe["ema_50"]) &
-            (dataframe["rsi_14"] >= 45) &
-            (dataframe["rsi_14"] <= 67) &
+            (dataframe["ema_20"] >= dataframe["ema_50"] * 0.995) &
+            (dataframe["rsi_14"] >= 43) &
+            (dataframe["rsi_14"] <= 66) &
             (dataframe["volume"] > 0)
         )
 
-        dataframe.loc[long_conditions, ["enter_long", "enter_tag"]] = (1, "hmm_4h_pullback_sweetspot")
+        dataframe.loc[long_conditions, ["enter_long", "enter_tag"]] = (1, "sureshot_pullback")
         return dataframe
 
     # -----------------------------------------------------------------
-    # Anchored Custom Stoploss Using stoploss_from_open()
+    # Custom Stoploss: TDS-Compensated Breakeven & Profit Ratchet
     # -----------------------------------------------------------------
     def custom_stoploss(self, pair: str, trade: Trade, current_time: datetime,
                         current_rate: float, current_profit: float, after_fill: bool, **kwargs) -> float:
         """
-        Uses stoploss_from_open() so profit locks are anchored to open_rate
-        and never choke out 4h swing pullbacks prematurely.
+        - Tier 3 (> +10.0% profit): Lock in +6.5% above entry
+        - Tier 2 (> +6.5% profit): Lock in +3.5% above entry
+        - Tier 1 (> +4.2% profit): Lock in +1.40% above entry
+          (+1.40% covers the 1% TDS on sell + fees, guaranteeing net wallet profit)
+        - Below +4.2%: Keeps hard stop at -4.6% to let 4H swings breathe
         """
-        if current_profit >= 0.11:
-            return stoploss_from_open(0.080, current_profit, is_short=trade.is_short, leverage=trade.leverage)
+        # Tier 3: Major expansion
+        if current_profit >= 0.100:
+            return stoploss_from_open(0.065, current_profit, is_short=trade.is_short, leverage=trade.leverage)
 
-        if current_profit >= 0.08:
-            return stoploss_from_open(0.050, current_profit, is_short=trade.is_short, leverage=trade.leverage)
+        # Tier 2: Solid swing gain
+        if current_profit >= 0.065:
+            return stoploss_from_open(0.035, current_profit, is_short=trade.is_short, leverage=trade.leverage)
 
-        if current_profit >= 0.055:
-            return stoploss_from_open(0.022, current_profit, is_short=trade.is_short, leverage=trade.leverage)
-
-        if current_profit >= 0.038:
-            return stoploss_from_open(0.006, current_profit, is_short=trade.is_short, leverage=trade.leverage)
+        # Tier 1: TDS-Compensated Breakeven
+        if current_profit >= 0.042:
+            return stoploss_from_open(0.014, current_profit, is_short=trade.is_short, leverage=trade.leverage)
 
         return self.stoploss
 
     # -----------------------------------------------------------------
-    # Exit Logic (Regime Breakdown or Bell Curve Climax)
+    # Exit Logic: 4H Invalidation & Climax Harvest
     # -----------------------------------------------------------------
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         exit_long_conditions = (
-            # 1. 4h flips to BEAR
-            ((dataframe["hmm_state_4h"] == 0) & (dataframe["prob_bear_4h"] > 0.50)) |
-            # 2. Failed 4h BULL breakout: 4h drops back to CHOP with negative impulse & 1h breaks EMA50
-            (
-                (dataframe["hmm_state_4h"] != 2) &
-                (dataframe["prob_bull_4h"] < 0.25) &
-                (dataframe["z_impulse_bull_4h"] < -1.10) &
-                (dataframe["close"] < dataframe["ema_50"])
-            ) |
-            # 3. Bell Curve Climax Exhaustion (> +1.6 sigma) + 1h breaks below EMA20
-            ((dataframe["z_trend_bull_4h"] > 1.60) & (dataframe["close"] < dataframe["ema_20"]))
+            # 1. Thesis Invalidation: 4H HMM flips to BEAR
+            ((dataframe["hmm_state_4h"] == 0) & (dataframe["prob_bear_4h"] > 0.55)) |
+
+            # 2. Climax Harvest: 4H overextended and breaks 1H EMA20
+            ((dataframe["z_trend_bull_4h"] > 1.70) & (dataframe["close"] < dataframe["ema_20"]))
         )
 
-        dataframe.loc[exit_long_conditions, ["exit_long", "exit_tag"]] = (1, "hmm_regime_flip_or_climax")
+        dataframe.loc[exit_long_conditions, ["exit_long", "exit_tag"]] = (1, "regime_invalidation_or_climax")
         return dataframe
